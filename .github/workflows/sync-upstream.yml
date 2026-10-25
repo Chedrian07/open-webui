@@ -1,0 +1,148 @@
+name: Sync fork from upstream
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-fork-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'Chedrian07/open-webui' && github.repository_owner_id == '108463785'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - name: Sync the default branch while preserving fork commits
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, time
+          import urllib.error, urllib.parse, urllib.request
+
+          REPO, REPO_ID = "Chedrian07/open-webui", "1426482417"
+          PARENT, PARENT_ID = "open-webui/open-webui", "701547123"
+          OWNER_ID = "108463785"
+
+          class APIError(Exception):
+              def __init__(self, status, message):
+                  self.status = status
+                  super().__init__(str(message))
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, fp, code, message, headers, new_url):
+                  return None
+
+          class API:
+              def __init__(self, token):
+                  self.token = token
+                  self.opener = urllib.request.build_opener(NoRedirect())
+
+              def request(self, method, path, payload=None):
+                  if not path.startswith("/repos/") or "://" in path:
+                      raise RuntimeError("Unexpected API path")
+                  data = None if payload is None else json.dumps(payload).encode()
+                  request = urllib.request.Request("https://api.github.com" + path, data=data, method=method, headers={
+                      "Authorization": "Bearer " + self.token, "Accept": "application/vnd.github+json",
+                      "Content-Type": "application/json", "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "Chedrian07-fork-sync",
+                  })
+                  for attempt in range(3):
+                      try:
+                          with self.opener.open(request, timeout=25) as response:
+                              return json.load(response)
+                      except urllib.error.HTTPError as error:
+                          try:
+                              message = json.loads(error.read(8192)).get("message", str(error.reason))
+                          except (ValueError, AttributeError):
+                              message = str(error.reason)
+                          retry = error.code == 429 or error.code >= 500 or (error.code == 403 and error.headers.get("X-RateLimit-Remaining") == "0")
+                          if retry and attempt < 2:
+                              time.sleep(2 ** (attempt + 1))
+                              continue
+                          raise APIError(error.code, str(message).replace(self.token, "[REDACTED]")[:250]) from None
+                      except (urllib.error.URLError, TimeoutError):
+                          if attempt < 2:
+                              time.sleep(2 ** (attempt + 1))
+                              continue
+                          raise RuntimeError("GitHub connection failed after three attempts") from None
+
+          def head(api, repo, branch):
+              path = urllib.parse.quote(branch, safe="")
+              sha = api.request("GET", f"/repos/{repo}/git/ref/heads/{path}").get("object", {}).get("sha", "")
+              if len(sha) != 40 or any(c not in "0123456789abcdef" for c in sha):
+                  raise RuntimeError("Invalid branch SHA")
+              return sha
+
+          def compare(api, base, tip):
+              return api.request("GET", f"/repos/{REPO}/compare/{base}...{tip}?per_page=1")
+
+          def sync(api):
+              repo = api.request("GET", f"/repos/{REPO}")
+              valid = (str(repo.get("id")) == REPO_ID and repo.get("full_name") == REPO
+                       and str(repo.get("owner", {}).get("id")) == OWNER_ID and repo.get("fork") is True
+                       and str(repo.get("parent", {}).get("id")) == PARENT_ID
+                       and repo.get("parent", {}).get("full_name") == PARENT)
+              if not valid:
+                  raise RuntimeError("Fork or upstream identity changed; no update attempted")
+              if repo.get("archived") or repo.get("disabled") or repo.get("permissions", {}).get("push") is False:
+                  raise RuntimeError("Fork is archived, disabled, or not writable")
+              parent = api.request("GET", f"/repos/{PARENT}")
+              if str(parent.get("id")) != PARENT_ID or parent.get("full_name") != PARENT:
+                  raise RuntimeError("Upstream identity changed; no update attempted")
+              branch = repo.get("default_branch")
+              if not branch or branch != parent.get("default_branch"):
+                  raise RuntimeError("Default branches differ; no update attempted")
+              old, upstream = head(api, REPO, branch), head(api, PARENT, branch)
+              if old == upstream:
+                  return "Already synced."
+              diff = compare(api, old, upstream)
+              if diff.get("status") in ("behind", "identical") and diff.get("ahead_by") == 0:
+                  return "Upstream already included; fork commits preserved."
+              if diff.get("status") not in ("ahead", "diverged") or not isinstance(diff.get("ahead_by"), int) or diff["ahead_by"] <= 0:
+                  raise RuntimeError("Unexpected comparison result; no update attempted")
+              api.request("POST", f"/repos/{REPO}/merge-upstream", {"branch": branch})
+              new = head(api, REPO, branch)
+              for ancestor in (old, upstream):
+                  if ancestor != new:
+                      verification = compare(api, ancestor, new)
+                      if verification.get("status") not in ("ahead", "identical") or verification.get("behind_by") != 0:
+                          raise RuntimeError("Verification failed: expected fork/upstream history is missing")
+              return f"Synced {diff['ahead_by']} upstream commit(s); fork history preserved."
+
+          def main(api=None):
+              token = os.environ.get("GITHUB_TOKEN", "")
+              try:
+                  if os.environ.get("GITHUB_REPOSITORY") != REPO or os.environ.get("GITHUB_REPOSITORY_OWNER_ID") != OWNER_ID:
+                      raise RuntimeError("Unexpected workflow repository or owner")
+                  if api is None and not token:
+                      raise RuntimeError("GITHUB_TOKEN is missing")
+                  message, failed = sync(api if api is not None else API(token)), False
+              except APIError as error:
+                  failed = True
+                  if error.status == 409:
+                      message = "Merge conflict: resolve the upstream merge in this fork. Existing commits were preserved."
+                  elif error.status in (403, 422) and "workflow" in str(error).lower():
+                      message = "GitHub rejected upstream workflow-file changes with GITHUB_TOKEN. Use manual Sync fork, or configure an optional repository-scoped token with Contents and Workflows write permissions."
+                  else:
+                      message = f"GitHub HTTP {error.status}: {error}"
+              except Exception as error:
+                  message, failed = str(error), True
+              message = message.replace(token, "[REDACTED]") if token else message
+              message = message.replace("\r", " ").replace("\n", " ")
+              print(("::error::" if failed else "") + message)
+              if os.environ.get("GITHUB_STEP_SUMMARY"):
+                  with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                      summary.write(f"## Fork sync\n\n[{REPO}](https://github.com/{REPO}) ← [{PARENT}](https://github.com/{PARENT})\n\n{message}\n")
+              return int(failed)
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
