@@ -92,8 +92,8 @@ jobs:
                        and repo.get("parent", {}).get("full_name") == PARENT)
               if not valid:
                   raise RuntimeError("Fork or upstream identity changed; no update attempted")
-              if repo.get("archived") or repo.get("disabled") or repo.get("permissions", {}).get("push") is False:
-                  raise RuntimeError("Fork is archived, disabled, or not writable")
+              if repo.get("archived") or repo.get("disabled"):
+                  raise RuntimeError("Fork is archived or disabled")
               parent = api.request("GET", f"/repos/{PARENT}")
               if str(parent.get("id")) != PARENT_ID or parent.get("full_name") != PARENT:
                   raise RuntimeError("Upstream identity changed; no update attempted")
